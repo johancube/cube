@@ -240,7 +240,7 @@ class ApiGateway {
       const { query, variables } = req.body;
       const compilerApi = await this.getCompilerApi(req.context);
 
-      const metaConfig = await compilerApi.metaConfig({
+      const metaConfig = await compilerApi.metaConfig(req.context, {
         requestId: req.context.requestId,
       });
 
@@ -273,7 +273,7 @@ class ApiGateway {
         const compilerApi = await this.getCompilerApi(req.context);
         let schema = compilerApi.getGraphQLSchema();
         if (!schema) {
-          let metaConfig = await compilerApi.metaConfig({
+          let metaConfig = await compilerApi.metaConfig(req.context, {
             requestId: req.context.requestId,
           });
           metaConfig = this.filterVisibleItemsInMeta(req.context, metaConfig);
@@ -564,6 +564,7 @@ class ApiGateway {
   private filterVisibleItemsInMeta(context: RequestContext, cubes: any[]) {
     const isDevMode = getEnv('devMode');
     function visibilityFilter(item) {
+      console.log('visibilityFilter', item, isDevMode, context.signedWithPlaygroundAuthSecret, item.isVisible);
       return isDevMode || context.signedWithPlaygroundAuthSecret || item.isVisible;
     }
 
@@ -589,7 +590,7 @@ class ApiGateway {
     try {
       await this.assertApiScope('meta', context.securityContext);
       const compilerApi = await this.getCompilerApi(context);
-      const metaConfig = await compilerApi.metaConfig({
+      const metaConfig = await compilerApi.metaConfig(context, {
         requestId: context.requestId,
         includeCompilerId: includeCompilerId || onlyCompilerId
       });
@@ -625,7 +626,7 @@ class ApiGateway {
     try {
       await this.assertApiScope('meta', context.securityContext);
       const compilerApi = await this.getCompilerApi(context);
-      const metaConfigExtended = await compilerApi.metaConfigExtended({
+      const metaConfigExtended = await compilerApi.metaConfigExtended(context, {
         requestId: context.requestId,
       });
       const { metaConfig, cubeDefinitions } = metaConfigExtended;
@@ -1048,7 +1049,7 @@ class ApiGateway {
           } else {
             const metaCacheKey = JSON.stringify(ctx);
             if (!metaCache.has(metaCacheKey)) {
-              metaCache.set(metaCacheKey, await compiler.metaConfigExtended(ctx));
+              metaCache.set(metaCacheKey, await compiler.metaConfigExtended(context, ctx));
             }
 
             // checking and fetching result status
@@ -1233,8 +1234,14 @@ class ApiGateway {
           }
 
           const normalizedQuery = normalizeQuery(currentQuery, persistent);
-          let rewrittenQuery = await this.queryRewrite(
+          // First apply cube/view level security policies
+          let rewrittenQuery = (await this.compilerApi(context)).applyRowLevelSecurity(
             normalizedQuery,
+            context
+          );
+          // Then apply user-supplied queryRewrite
+          rewrittenQuery = await this.queryRewrite(
+            rewrittenQuery,
             context,
           );
 
@@ -1552,7 +1559,7 @@ class ApiGateway {
     if (normalizedQuery.total) {
       const normalizedTotal = structuredClone(normalizedQuery);
       normalizedTotal.totalQuery = true;
-      
+
       delete normalizedTotal.order;
 
       normalizedTotal.limit = null;
@@ -1731,7 +1738,7 @@ class ApiGateway {
         await this.getNormalizedQueries(query, context);
 
       let metaConfigResult = await (await this
-        .getCompilerApi(context)).metaConfig({
+        .getCompilerApi(context)).metaConfig(request.context, {
         requestId: context.requestId
       });
 
@@ -1841,7 +1848,7 @@ class ApiGateway {
         await this.getNormalizedQueries(query, context, request.streaming, request.memberExpressions);
 
       const compilerApi = await this.getCompilerApi(context);
-      let metaConfigResult = await compilerApi.metaConfig({
+      let metaConfigResult = await compilerApi.metaConfig(request.context, {
         requestId: context.requestId
       });
 

@@ -554,6 +554,61 @@ const SegmentsSchema = Joi.object().pattern(identifierRegex, Joi.object().keys({
   public: Joi.boolean().strict(),
 }));
 
+const PolicyFilterSchema = Joi.object().keys({
+  member: Joi.func().required(),
+  memberReference: Joi.string().required(),
+  operator: Joi.any().valid(
+    'equals',
+    'notEquals',
+    'contains',
+    'notContains',
+    'startsWith',
+    'notStartsWith',
+    'endsWith',
+    'notEndsWith',
+    'gt',
+    'gte',
+    'lt',
+    'lte',
+    'inDateRange',
+    'notInDateRange',
+    'beforeDate',
+    'beforeOrOnDate',
+    'afterDate',
+    'afterOrOnDate',
+  ).required(),
+  values: Joi.func().required(),
+});
+
+const MemberLevelPolicySchema = Joi.object().keys({
+  excludes: Joi.func(),
+  includes: Joi.func(),
+  includesMembers: Joi.array().items(Joi.string().required()),
+  excludesMembers: Joi.array().items(Joi.string().required()),
+});
+
+const RowLevelPolicySchema = Joi.object().keys({
+
+  filters: Joi.array().items(Joi.alternatives().try(
+    Joi.object().keys({
+      or: Joi.array().items(PolicyFilterSchema).required(),
+      and: Joi.array().items(PolicyFilterSchema).required(),
+    }),
+    PolicyFilterSchema,
+  )).required(),
+});
+
+// TODO(maxim): follow the "ATTENTION" thing below
+const RolePolicySchema = Joi.object().keys({
+  role: Joi.string().required(),
+  memberLevel: MemberLevelPolicySchema,
+  rowLevel: RowLevelPolicySchema,
+  conditions: Joi.array().items(Joi.object().keys({
+    if: Joi.func().required(),
+  })),
+  // evaluatedConditions: Joi.array().items(Joi.boolean()),
+});
+
 /* *****************************
  * ATTENTION:
  * In case of adding/removing/changing any Joi.func() field that needs to be transpiled,
@@ -631,6 +686,7 @@ const baseSchema = {
     title: Joi.string(),
     levels: Joi.func()
   })),
+  accessPolicy: Joi.array().items(RolePolicySchema),
 };
 
 const cubeSchema = inherit(baseSchema, {

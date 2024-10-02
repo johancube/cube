@@ -185,6 +185,102 @@ export class CompilerApi {
     }
   }
 
+  getRolesFromContext(context) {
+    const securityContext = (context && context.securityContext) || {};
+    return new Set((securityContext.cloud && securityContext.cloud.roles) || []);
+  }
+
+  userHasRole(userRoles, role) {
+    return userRoles.has(role);
+  }
+
+  roleMeetsConditions(evaluatedConditions) {
+    if (evaluatedConditions && evaluatedConditions.length) {
+      return evaluatedConditions.reduce((a, b) => {
+        if (typeof b !== 'boolean') {
+          throw new Error(`Access policy condition must return boolean, got ${JSON.stringify(b)}`);
+        }
+        return a || b;
+      });
+    }
+    return true;
+  }
+
+  async getCubesFromQuery(query) {
+    const sql = await this.getSql(query, { requestId: query.requestId });
+    return new Set(sql.memberNames.map(memberName => memberName.split('.')[0]));
+  }
+
+  getApplicablePolicies(cube, context, cubeEvaluator) {
+    const userRoles = this.getRolesFromContext(context);
+    return cube.accessPolicy.filter(policy => {
+      const evaluatedConditions = (policy.conditions || []).map(
+        condition => cubeEvaluator.evaluateContextFunction(cube, condition.if, context)
+      );
+      const res = this.userHasRole(userRoles, policy.role) && this.roleMeetsConditions(evaluatedConditions);
+      return res;
+    });
+  }
+
+  rlsEnabledForCube(cube) {
+    return cube.accessPolicy && cube.accessPolicy.length && cube.accessPolicy.length > 0;
+  }
+
+  isRlsEnabled(cubeEvaluator) {
+    return cubeEvaluator.cubeNames().some(cubeName => this.rlsEnabledForCube(cubeEvaluator.cubeFromPath(cubeName)));
+  }
+
+  async applyRowLevelSecurity(query, context) {
+    const { cubeEvaluator } = await this.getCompilers({ requestId: query.requestId });
+    if (!this.isRlsEnabled(cubeEvaluator)) {
+      return query;
+    }
+    console.log('Applying RLS');
+    const queryCubes = await this.getCubesFromQuery(query);
+    // TODO(maxim): how do we determine when "new style" RLS is on?
+    // when at least one accessPolicy is defined?
+    const filtersPerRole = {};
+    cubeEvaluator.cubeNames().forEach(cubeName => {
+      const cube = cubeEvaluator.cubeFromPath(cubeName);
+      if (queryCubes.has(cube.name) && this.rlsEnabledForCube(cube)) {
+        let hasRoleWithAccess = false;
+        for (const policy of this.getApplicablePolicies(cube, context, cubeEvaluator)) {
+          console.log('Processing policy for cube: ', cube.name, policy);
+          hasRoleWithAccess = true;
+          (policy?.rowLevel?.filters || []).forEach(filter => {
+            filtersPerRole[policy.role] = filtersPerRole[policy.role] || [];
+            const evaluatedValues = cubeEvaluator.evaluateContextFunction(
+              cube,
+              filter.values,
+              context
+            );
+            console.log('pushing a filter for role', filter, policy.role);
+            filtersPerRole[policy.role].push({
+              member: filter.memberReference,
+              operator: filter.operator,
+              values: evaluatedValues
+            });
+          });
+        }
+        if (!hasRoleWithAccess) {
+          query.segments.push({
+            expression: () => '1 = 0',
+            cubeName: cube.name,
+            name: 'RLS Access Denied',
+          });
+        }
+      }
+    });
+    const rlsFilter = {
+      or: Object.keys(filtersPerRole).map(role => ({
+        and: filtersPerRole[role]
+      }))
+    };
+    console.log('rlsFilter', rlsFilter);
+    query.filters.push(rlsFilter);
+    return query;
+  }
+
   async compilerCacheFn(requestId, key, path) {
     const compilers = await this.getCompilers({ requestId });
     if (this.sqlCache) {
@@ -229,22 +325,94 @@ export class CompilerApi {
     );
   }
 
-  async metaConfig(options = {}) {
+  filterVisibilityByAccessPolicy(cubeEvaluator, context, cubes) {
+    const isMemberVisibleInContext = {};
+
+    if (!this.isRlsEnabled(cubeEvaluator)) {
+      return cubes;
+    }
+
+    for (const cube of cubes.filter(c => this.rlsEnabledForCube(c.config))) {
+      console.log('filterVisibilityByAccessPolicy', cube.config.name);
+      const evaluatedCube = cubeEvaluator.cubeFromPath(cube.config.name);
+
+      const calculateContextVisibility = (item) => {
+        let isIncluded = false;
+        let isExplicitlyExcluded = false;
+        for (const policy of this.getApplicablePolicies(evaluatedCube, context, cubeEvaluator)) {
+          if (policy.memberLevel) {
+            isIncluded = policy.memberLevel.includesMembers.includes(item.name) || isIncluded;
+            isExplicitlyExcluded = policy.memberLevel.excludesMembers.includes(item.name) || isExplicitlyExcluded;
+          } else {
+            // TODO(maxim): validate this, it looks sus
+            // a policy without explicit memberLevel definition implicitly allow all members
+            isIncluded = true;
+          }
+        }
+        return isIncluded && !isExplicitlyExcluded;
+      };
+
+      for (const dimension of cube.config.dimensions) {
+        isMemberVisibleInContext[dimension.name] = calculateContextVisibility(dimension);
+      }
+
+      for (const measure of cube.config.measures) {
+        isMemberVisibleInContext[measure.name] = calculateContextVisibility(measure);
+      }
+
+      // TODO(maxim): should we filter segments as well?
+      // for (const segment of cube.config.segments) {
+      //   isMemberVisibleInContext[segment.name] = calculateContextVisibility(segment);
+      // }
+    }
+
+    console.log('isMemberVisibleInContext', isMemberVisibleInContext);
+
+    const visibilityFilterForCube = (cube) => {
+      if (!this.rlsEnabledForCube(cube.config)) {
+        return (item) => item.isVisible;
+      }
+      return (item) => (item.isVisible && isMemberVisibleInContext[item.name] || false);
+    };
+
+    return cubes
+      .map((cube) => ({
+        config: {
+          ...cube.config,
+          measures: cube.config.measures?.filter(visibilityFilterForCube(cube)),
+          dimensions: cube.config.dimensions?.filter(visibilityFilterForCube(cube)),
+          // segments: cube.config.segments?.filter(visibilityFilterForCube(cube)),
+        },
+      })).filter(
+        cube => cube.config.measures?.length ||
+          cube.config.dimensions?.length ||
+          cube.config.segments?.length
+      );
+  }
+
+  async metaConfig(requestContext, options = {}) {
     const { includeCompilerId, ...restOptions } = options;
     const compilers = await this.getCompilers(restOptions);
+    const { cubes } = compilers.metaTransformer;
+    const filteredCubes = this.filterVisibilityByAccessPolicy(compilers.cubeEvaluator, requestContext, cubes);
     if (includeCompilerId) {
       return {
-        cubes: compilers.metaTransformer.cubes,
+        cubes: filteredCubes,
         compilerId: compilers.compilerId,
       };
     }
-    return compilers.metaTransformer.cubes;
+    return filteredCubes;
   }
 
-  async metaConfigExtended(options) {
-    const { metaTransformer } = await this.getCompilers(options);
+  async metaConfigExtended(requestContext, options) {
+    const { metaTransformer, cubeEvaluator } = await this.getCompilers(options);
+    const filteredCubes = this.filterVisibilityByAccessPolicy(
+      cubeEvaluator,
+      requestContext,
+      metaTransformer?.cubes
+    );
     return {
-      metaConfig: metaTransformer?.cubes,
+      metaConfig: filteredCubes,
       cubeDefinitions: metaTransformer?.cubeEvaluator?.cubeDefinitions,
     };
   }

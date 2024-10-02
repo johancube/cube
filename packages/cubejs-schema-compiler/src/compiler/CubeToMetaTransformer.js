@@ -39,7 +39,7 @@ export class CubeToMetaTransformer {
    */
   transform(cube) {
     const cubeTitle = cube.title || this.titleize(cube.name);
-    
+
     const isCubeVisible = this.isVisible(cube, true);
 
     return {
@@ -95,6 +95,7 @@ export class CubeToMetaTransformer {
           })),
           R.toPairs
         )(cube.segments || {}),
+        accessPolicy: cube.accessPolicy || [],
         hierarchies: cube.hierarchies || []
       },
     };
